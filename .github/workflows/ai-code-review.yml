@@ -1,0 +1,182 @@
+# AI Code Review Crew - GitHub Action
+# 
+# This workflow automatically runs the AI code review when a Pull Request
+# is opened or updated. The review is posted as a comment on the PR.
+#
+# HOW TO ENABLE:
+# 1. Add this file to your repository at .github/workflows/ai-code-review.yml
+# 2. Add your ANTHROPIC_API_KEY to repository secrets (Settings → Secrets → Actions)
+# 3. Open a Pull Request — the review will run automatically
+#
+# WHAT IT DOES:
+# - Triggers on PR open, update, or when "ready for review"
+# - Extracts the changed files from the PR
+# - Sends code to the AI Code Review Crew
+# - Posts the review as a PR comment
+#
+# Author: Patricia Chang
+# Repository: https://github.com/patriciachang/agentic-ai-code-reviews
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    # Only run on these file types (customize as needed)
+    paths:
+      - '**.php'
+      - '**.module'
+      - '**.theme'
+      - '**.js'
+      - '**.css'
+      - '**.twig'
+      - '**.py'
+
+# Prevent multiple reviews running simultaneously on same PR
+concurrency:
+  group: ai-review-${{ github.head_ref }}
+  cancel-in-progress: true
+
+jobs:
+  ai-code-review:
+    name: Run AI Code Review
+    runs-on: ubuntu-latest
+    
+    # Don't run on draft PRs
+    if: github.event.pull_request.draft == false
+    
+    permissions:
+      contents: read
+      pull-requests: write  # Required to post comments
+    
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history to get diff
+      
+      # Step 2: Set up Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      
+      # Step 3: Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install crewai python-dotenv anthropic
+      
+      # Step 4: Get the changed files from the PR
+      - name: Get changed files
+        id: changed-files
+        run: |
+          # Get the diff between base and head
+          git diff --name-only origin/${{ github.base_ref }}...HEAD > changed_files.txt
+          
+          # Filter to only code files we care about
+          grep -E '\.(php|module|theme|js|css|twig|py)$' changed_files.txt > code_files.txt || true
+          
+          echo "Changed code files:"
+          cat code_files.txt
+      
+      # Step 5: Extract code content for review
+      - name: Prepare code for review
+        id: prepare-code
+        run: |
+          # Concatenate all changed files with headers
+          echo "" > code_to_review.txt
+          
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              echo "========== FILE: $file ==========" >> code_to_review.txt
+              cat "$file" >> code_to_review.txt
+              echo -e "\n" >> code_to_review.txt
+            fi
+          done < code_files.txt
+          
+          # Check if we have any code to review
+          if [ ! -s code_to_review.txt ]; then
+            echo "No code files to review"
+            echo "skip_review=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip_review=false" >> $GITHUB_OUTPUT
+          fi
+      
+      # Step 6: Run the AI Code Review
+      - name: Run AI Code Review
+        id: ai-review
+        if: steps.prepare-code.outputs.skip_review != 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Create a Python script to run the review
+          cat << 'EOF' > run_review.py
+          import os
+          from crew import run_code_review
+          
+          # Read the code to review
+          with open('code_to_review.txt', 'r') as f:
+              code = f.read()
+          
+          # Run the review
+          result = run_code_review(code)
+          
+          # Save the result
+          with open('review_result.md', 'w') as f:
+              f.write(result)
+          
+          print("Review complete!")
+          EOF
+          
+          python run_review.py
+      
+      # Step 7: Post the review as a PR comment
+      - name: Post review comment
+        if: steps.prepare-code.outputs.skip_review != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Read the review result
+            const review = fs.readFileSync('review_result.md', 'utf8');
+            
+            // Create the comment body
+            const body = `## 🤖 AI Code Review
+            
+            The AI Code Review Crew has analyzed this PR. Please review the findings below.
+            
+            ---
+            
+            ${review}
+            
+            ---
+            
+            <sub>🔍 Powered by [AI Code Review Crew](https://github.com/patriciachang/agentic-ai-code-reviews) | 5 specialized agents analyzing code quality, security, accessibility, and infrastructure</sub>`;
+            
+            // Post the comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+            
+            console.log('Review posted successfully!');
+      
+      # Step 8: Set PR status based on review decision
+      - name: Update PR status
+        if: steps.prepare-code.outputs.skip_review != 'true'
+        run: |
+          # Check if the review contains REJECT or REQUEST CHANGES
+          if grep -q "DECISION: REJECT" review_result.md; then
+            echo "::warning::AI Review recommends REJECTING this PR"
+            exit 1  # Fail the check
+          elif grep -q "DECISION: REQUEST CHANGES" review_result.md; then
+            echo "::warning::AI Review found issues that should be addressed"
+            # Don't fail, but warn
+          else
+            echo "::notice::AI Review APPROVED this PR"
+          fi
